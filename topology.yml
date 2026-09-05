@@ -1,0 +1,72 @@
+name: trad-soc
+
+hosts:
+  - name: enterprise-host
+    flavor: standard.small
+    base_box:
+      image: ubuntu-20.04-server-cloudimg-amd64
+      mgmt_user: enterprise
+  - name: attacker-host
+    flavor: standard.small
+    base_box:
+      image: kali
+      mgmt_user: attacker
+  - name: soc-host
+    flavor: standard.small
+    base_box:
+      image: kali
+      mgmt_user: soc
+
+routers:
+  - name: enterprise-router
+    flavor: standard.small
+    base_box:
+      image: ubuntu-20.04-server-cloudimg-amd64
+      mgmt_user: ubuntu
+  - name: attacker-router
+    flavor: standard.small
+    base_box:
+      image: ubuntu-20.04-server-cloudimg-amd64
+      mgmt_user: ubuntu
+
+networks:
+  - name: enterprise-net
+    cidr: 10.10.10.0/25
+    accessible_by_user: true
+  - name: attacker-net
+    cidr: 192.168.1.0/24
+    accessible_by_user: true
+  - name: soc-net
+    cidr: 10.10.10.128/25
+    accessible_by_user: true
+
+net_mappings:
+  - host: enterprise-host
+    network: enterprise-net
+    ip: 10.10.10.10
+  - host: soc-host
+    network: soc-net
+    ip: 10.10.10.200
+  - host: attacker-host
+    network: attacker-net
+    ip: 192.168.1.10
+
+router_mappings:
+  - router: enterprise-router
+    network: enterprise-net
+    ip: 10.10.10.1
+  - router: enterprise-router
+    network: soc-net
+    ip: 10.10.10.129
+  - router: attacker-router
+    network: attacker-net
+    ip: 192.168.1.1
+
+groups:
+  - name: enterprise
+    nodes:
+      - enterprise-host
+      - soc-host
+  - name: attacker
+    nodes:
+      - attacker-host

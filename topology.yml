@@ -5,17 +5,17 @@ hosts:
     flavor: standard.small
     base_box:
       image: ubuntu-20.04-server-cloudimg-amd64
-      mgmt_user: enterprise
+      mgmt_user: ubuntu
   - name: attacker-host
     flavor: standard.small
     base_box:
       image: kali
-      mgmt_user: attacker
+      mgmt_user: kali
   - name: soc-host
     flavor: standard.small
     base_box:
       image: kali
-      mgmt_user: soc
+      mgmt_user: kali
 
 routers:
   - name: enterprise-router

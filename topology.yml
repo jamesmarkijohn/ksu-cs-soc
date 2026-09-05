@@ -10,12 +10,12 @@ hosts:
     flavor: standard.small
     base_box:
       image: kali
-      mgmt_user: kali
+      mgmt_user: debian
   - name: soc-host
     flavor: standard.small
     base_box:
       image: kali
-      mgmt_user: kali
+      mgmt_user: debian
 
 routers:
   - name: enterprise-router

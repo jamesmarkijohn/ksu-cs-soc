@@ -4,6 +4,7 @@
   become: true
   vars:
     vnc_user: kali
+    kali_password: "nZIGzd7G&2"
     vnc_password: "{{ (((kypo_global_sandbox_id | default(ansible_machine_id) | default(inventory_hostname)) ~ 'v73efn#woPs') | hash('sha1'))[:12] }}"
     vnc_display: "1"
     vnc_geometry: "1280x720"
@@ -62,6 +63,16 @@
       loop:
         - "{{ vnc_user }}"
         - root
+
+    - name: Set kali user login password
+      ansible.builtin.user:
+        name: "{{ vnc_user }}"
+        password: "{{ kali_password | password_hash('sha512') }}"
+
+    - name: Lock password login for root only (no default root credentials)
+      ansible.builtin.user:
+        name: root
+        password_lock: true
 
     - name: Install XFCE + TigerVNC
       ansible.builtin.apt:

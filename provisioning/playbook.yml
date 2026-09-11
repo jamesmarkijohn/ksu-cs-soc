@@ -1,1 +1,213 @@
-- hosts: all
+---
+- name: Kali GUI via VNC (XFCE + TigerVNC) for Guacamole
+  hosts: attacker-host
+  become: true
+  vars:
+    vnc_user: kali
+    vnc_password: "{{ ((kypo_global_sandbox_id ~ 'v73efn#woPs') | hash('sha1'))[:12] }}"    vnc_display: "1"
+    vnc_geometry: "1280x720"
+    vnc_depth: "24"
+    allow_vnc_nonlocal: true
+    vnc_localhost_flag: "{{ '-localhost no' if allow_vnc_nonlocal else '-localhost yes' }}"
+    vnc_cfg_dir: "/home/{{ vnc_user }}/.config/tigervnc"
+
+  handlers:
+    - name: restart ssh
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+
+  tasks:
+    - name: Ensure bootstrap SSH user exists (CRCZP key-based access)
+      ansible.builtin.user:
+        name: user
+        shell: /bin/bash
+        create_home: true
+        groups: sudo
+        append: true
+
+    - name: Allow CRCZP-generated SSH public key for bootstrap user
+      ansible.builtin.authorized_key:
+        user: user
+        state: present
+        key: "{{ lookup('file', global_ssh_public_user_key) }}"
+
+    - name: Allow passwordless sudo for bootstrap user (no password set)
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/90-crczp-bootstrap-user
+        owner: root
+        group: root
+        mode: "0440"
+        content: |
+          user ALL=(ALL) NOPASSWD:ALL
+
+    - name: Disable password-based SSH authentication
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/90-crczp-keyonly.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          ChallengeResponseAuthentication no
+          PubkeyAuthentication yes
+      notify: restart ssh
+
+    - name: Lock password login for default accounts (no default credentials)
+      ansible.builtin.user:
+        name: "{{ item }}"
+        password_lock: true
+      loop:
+        - "{{ vnc_user }}"
+        - root
+
+    - name: Install XFCE + TigerVNC
+      ansible.builtin.apt:
+        update_cache: true
+        name:
+          - xfce4
+          - xfce4-goodies
+          - dbus-x11
+          - xauth
+          - tigervnc-standalone-server
+          - tigervnc-common
+        state: present
+
+    - name: Ensure TigerVNC config dir exists
+      ansible.builtin.file:
+        path: "{{ vnc_cfg_dir }}"
+        state: directory
+        owner: "{{ vnc_user }}"
+        group: "{{ vnc_user }}"
+        mode: "0700"
+
+    - name: Ensure ~/.vnc exists
+      ansible.builtin.file:
+        path: "/home/{{ vnc_user }}/.vnc"
+        state: directory
+        owner: "{{ vnc_user }}"
+        group: "{{ vnc_user }}"
+        mode: "0700"
+
+    - name: Set VNC password file
+      ansible.builtin.shell: |
+        set -euo pipefail
+        printf "%s\n" "{{ vnc_password }}" | vncpasswd -f > "{{ vnc_cfg_dir }}/passwd"
+        chown "{{ vnc_user }}:{{ vnc_user }}" "{{ vnc_cfg_dir }}/passwd"
+        chmod 0600 "{{ vnc_cfg_dir }}/passwd"
+      args:
+        executable: /bin/bash
+
+    - name: Set xstartup to launch XFCE (with dbus-launch)
+      ansible.builtin.copy:
+        dest: "{{ vnc_cfg_dir }}/xstartup"
+        owner: "{{ vnc_user }}"
+        group: "{{ vnc_user }}"
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          unset SESSION_MANAGER
+          unset DBUS_SESSION_BUS_ADDRESS
+          exec dbus-launch --exit-with-session startxfce4
+
+    - name: Remove stale VNC/X locks for display :{{ vnc_display }}
+      ansible.builtin.shell: |
+        rm -f /tmp/.X{{ vnc_display }}-lock /tmp/.X11-unix/X{{ vnc_display }} || true
+        rm -f /home/{{ vnc_user }}/.vnc/*:{{ vnc_display }}.pid || true
+        rm -f {{ vnc_cfg_dir }}/*:{{ vnc_display }}.pid || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Install vncserver@.service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/vncserver@.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=TigerVNC server on display :%i
+          After=network.target
+
+          [Service]
+          Type=simple
+          User={{ vnc_user }}
+          PAMName=login
+          WorkingDirectory=/home/{{ vnc_user }}
+
+          ExecStartPre=-/usr/bin/vncserver -kill :%i
+          ExecStart=/usr/bin/vncserver :%i -fg -geometry {{ vnc_geometry }} -depth {{ vnc_depth }} {{ vnc_localhost_flag }}
+          ExecStop=/usr/bin/vncserver -kill :%i
+
+          Restart=on-failure
+          RestartSec=2
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Start VNC on :{{ vnc_display }} (TCP 590{{ vnc_display }}) with diagnostics on failure
+      block:
+        - name: Start VNC service
+          ansible.builtin.systemd:
+            name: "vncserver@{{ vnc_display }}"
+            state: started
+            enabled: true
+
+      rescue:
+        - name: systemctl status vncserver@{{ vnc_display }}
+          ansible.builtin.command: "systemctl status vncserver@{{ vnc_display }} --no-pager -l"
+          register: vnc_status
+          changed_when: false
+          failed_when: false
+
+        - name: journalctl for vncserver@{{ vnc_display }}
+          ansible.builtin.command: "journalctl -xeu vncserver@{{ vnc_display }} --no-pager -n 200"
+          register: vnc_journal
+          changed_when: false
+          failed_when: false
+
+        - name: List ~/.vnc and ~/.config/tigervnc and show last 200 lines of logs
+          ansible.builtin.shell: |
+            set -e
+            echo "### ls -la /home/{{ vnc_user }}/.vnc"
+            ls -la /home/{{ vnc_user }}/.vnc || true
+            echo
+            echo "### ls -la {{ vnc_cfg_dir }}"
+            ls -la {{ vnc_cfg_dir }} || true
+            echo
+            echo "### tail of VNC logs (both locations)"
+            (ls -1 /home/{{ vnc_user }}/.vnc/*.log 2>/dev/null; ls -1 {{ vnc_cfg_dir }}/*.log 2>/dev/null) \
+              | sort -u | tail -n 10 | while read f; do
+                echo "----- $f -----"
+                tail -n 200 "$f" || true
+              done
+          args:
+            executable: /bin/bash
+          register: vnc_files
+          changed_when: false
+          failed_when: false
+
+        - name: Print diagnostics
+          ansible.builtin.debug:
+            msg: |
+              ===== systemctl status =====
+              {{ vnc_status.stdout | default('') }}
+              {{ vnc_status.stderr | default('') }}
+
+              ===== journalctl =====
+              {{ vnc_journal.stdout | default('') }}
+              {{ vnc_journal.stderr | default('') }}
+
+              ===== ~/.vnc + ~/.config/tigervnc logs =====
+              {{ vnc_files.stdout | default('') }}
+              {{ vnc_files.stderr | default('') }}
+
+        - name: Fail provisioning with captured diagnostics
+          ansible.builtin.fail:
+            msg: "VNC service failed to start; see diagnostics above."

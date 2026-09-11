@@ -4,7 +4,7 @@
   become: true
   vars:
     vnc_user: kali
-    vnc_password: "{{ ((kypo_global_sandbox_id ~ 'v73efn#woPs') | hash('sha1'))[:12] }}"
+    vnc_password: "{{ (((kypo_global_sandbox_id | default(ansible_machine_id) | default(inventory_hostname)) ~ 'v73efn#woPs') | hash('sha1'))[:12] }}"
     vnc_display: "1"
     vnc_geometry: "1280x720"
     vnc_depth: "24"

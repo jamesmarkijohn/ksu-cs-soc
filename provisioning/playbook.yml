@@ -1,6 +1,6 @@
 ---
 - name: Kali GUI via VNC (XFCE + TigerVNC) for Guacamole
-  hosts: attacker-host
+  hosts: attacker-host:soc-host
   become: true
   vars:
     vnc_user: kali

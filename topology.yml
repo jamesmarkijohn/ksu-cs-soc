@@ -1,7 +1,7 @@
 name: trad-soc
 
 hosts:
-  - name: enterprise-host
+  - name: enterprise-host-linux
     flavor: standard.small
     base_box:
       image: ubuntu-20.04-server-cloudimg-amd64
@@ -16,6 +16,31 @@ hosts:
     base_box:
       image: kali
       mgmt_user: debian
+  - name: enterprise-web
+    flavor: standard.small
+    base_box:
+      image: ubuntu-20.04-server-cloudimg-amd64
+      mgmt_user: ubuntu
+  - name: enterprise-app
+    flavor: standard.small
+    base_box:
+      image: ubuntu-20.04-server-cloudimg-amd64
+      mgmt_user: ubuntu
+  - name: enterprise-db
+    flavor: standard.small
+    base_box:
+      image: ubuntu-20.04-server-cloudimg-amd64
+      mgmt_user: ubuntu
+  - name: enterprise-file
+    flavor: standard.small
+    base_box:
+      image: ubuntu-20.04-server-cloudimg-amd64
+      mgmt_user: ubuntu
+  - name: enterprise-auth
+    flavor: standard.small
+    base_box:
+      image: ubuntu-20.04-server-cloudimg-amd64
+      mgmt_user: ubuntu
 
 routers:
   - name: enterprise-router
@@ -30,8 +55,11 @@ routers:
       mgmt_user: ubuntu
 
 networks:
-  - name: enterprise-net
-    cidr: 10.10.10.0/25
+  - name: enterprise-host-net
+    cidr: 10.10.10.0/26
+    accessible_by_user: true
+  - name: enterprise-prod-net
+    cidr: 10.10.10.64/26
     accessible_by_user: true
   - name: attacker-net
     cidr: 192.168.1.0/24
@@ -41,9 +69,24 @@ networks:
     accessible_by_user: true
 
 net_mappings:
-  - host: enterprise-host
-    network: enterprise-net
+  - host: enterprise-host-linux
+    network: enterprise-host-net
     ip: 10.10.10.10
+  - host: enterprise-web
+    network: enterprise-prod-net
+    ip: 10.10.10.66
+  - host: enterprise-app
+    network: enterprise-prod-net
+    ip: 10.10.10.67
+  - host: enterprise-db
+    network: enterprise-prod-net
+    ip: 10.10.10.68
+  - host: enterprise-file
+    network: enterprise-prod-net
+    ip: 10.10.10.69
+  - host: enterprise-auth
+    network: enterprise-prod-net
+    ip: 10.10.10.70
   - host: soc-host
     network: soc-net
     ip: 10.10.10.200
@@ -53,8 +96,11 @@ net_mappings:
 
 router_mappings:
   - router: enterprise-router
-    network: enterprise-net
+    network: enterprise-host-net
     ip: 10.10.10.1
+  - router: enterprise-router
+    network: enterprise-prod-net
+    ip: 10.10.10.65
   - router: enterprise-router
     network: soc-net
     ip: 10.10.10.129
@@ -63,9 +109,18 @@ router_mappings:
     ip: 192.168.1.1
 
 groups:
-  - name: enterprise
+  - name: enterprise-hosts
     nodes:
-      - enterprise-host
+      - enterprise-host-linux
+  - name: enterprise-servers
+    nodes:
+      - enterprise-web
+      - enterprise-app
+      - enterprise-db
+      - enterprise-file
+      - enterprise-auth
+  - name: soc
+    nodes:
       - soc-host
   - name: attacker
     nodes:

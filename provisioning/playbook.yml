@@ -223,3 +223,125 @@
         - name: Fail provisioning with captured diagnostics
           ansible.builtin.fail:
             msg: "VNC service failed to start; see diagnostics above."
+
+- name: Configure enterprise file server (SMB/Samba shared storage)
+  hosts: enterprise-file
+  become: true
+  vars:
+    corp_files_group: corpfiles
+    corp_files_path: /mnt/corp-files
+    smb_user: fileserver
+    smb_password: "ChangeMe-CorpFiles-2026!"   # temporary, will remove later
+    enterprise_network_cidr: 10.10.10.0/24
+    crczp_mgmt_cidr: 192.168.128.0/17          # CRCZP provisioning uses this subnet, it must be allowed
+
+  tasks:
+    - name: Install Samba
+      ansible.builtin.apt:
+        name: samba
+        state: present
+        update_cache: true
+
+    - name: Ensure corp-files group exists
+      ansible.builtin.group:
+        name: "{{ corp_files_group }}"
+        state: present
+
+    - name: Create shared corp-files directory
+      ansible.builtin.file:
+        path: "{{ corp_files_path }}"
+        state: directory
+        owner: root
+        group: "{{ corp_files_group }}"
+        mode: "2775"
+
+    - name: Create local fileserver system account (no shell login)
+      ansible.builtin.user:
+        name: "{{ smb_user }}"
+        groups: "{{ corp_files_group }}"
+        append: true
+        shell: /usr/sbin/nologin
+        create_home: false
+
+    - name: Set Samba password for fileserver account
+      ansible.builtin.shell: |
+        (echo "{{ smb_password }}"; echo "{{ smb_password }}") | smbpasswd -s -a "{{ smb_user }}"
+      no_log: true
+      changed_when: true
+
+    - name: Enable and unlock the Samba user
+      ansible.builtin.command: smbpasswd -e "{{ smb_user }}"
+      changed_when: true
+
+    - name: Configure Samba share
+      ansible.builtin.blockinfile:
+        path: /etc/samba/smb.conf
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - corp-files share"
+        block: |
+          [corp-files]
+          path = {{ corp_files_path }}
+          valid users = @{{ corp_files_group }}
+          force group = {{ corp_files_group }}
+          create mask = 0664
+          directory mask = 2775
+          read only = no
+          browseable = yes
+      notify: restart smbd
+
+    - name: Ensure iptables-persistent is installed
+      ansible.builtin.apt:
+        name: iptables-persistent
+        state: present
+
+    - name: Allow SMB (445) from the CRCZP management network
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "445"
+        source: "{{ crczp_mgmt_cidr }}"
+        jump: ACCEPT
+        comment: "CRCZP management network"
+
+    - name: Allow SMB (445) from the enterprise network (incl. SOC)
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "445"
+        source: "{{ enterprise_network_cidr }}"
+        jump: ACCEPT
+        comment: "Allow SMB from enterprise + SOC network"
+
+    - name: Allow legacy NetBIOS session (139) from enterprise network
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "139"
+        source: "{{ enterprise_network_cidr }}"
+        jump: ACCEPT
+        comment: "Allow NetBIOS session from enterprise + SOC network"
+
+    - name: Drop SMB (445) from everywhere else
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "445"
+        jump: DROP
+        comment: "Block SMB from outside enterprise network"
+
+    - name: Drop NetBIOS (139) from everywhere else
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "139"
+        jump: DROP
+        comment: "Block NetBIOS from outside enterprise network"
+
+    - name: Save iptables rules
+      ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
+      changed_when: false
+
+  handlers:
+    - name: restart smbd
+      ansible.builtin.service:
+        name: smbd
+        state: restarted

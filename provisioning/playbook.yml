@@ -280,7 +280,7 @@
 
     - name: Set Samba password for fileserver-admin
       ansible.builtin.shell: |
-        (echo "{{ smb_password }}"; echo "{{ smb_password }}") | smbpasswd -s -a "{{ smb_user }}"
+        (echo "{{ smb_password }}"; echo "{{ smb_password }}") | smbpasswd -s -a "{{ smb_admin }}"
       no_log: true
       changed_when: true
 

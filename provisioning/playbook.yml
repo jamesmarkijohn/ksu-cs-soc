@@ -231,6 +231,7 @@
     corp_files_group: corpfiles
     corp_files_path: /mnt/corp-files
     smb_user: fileserver
+    smb_admin: fileserver-admin
     smb_password: "ChangeMe-CorpFiles-2026!"   # temporary, will remove later
     enterprise_network_cidr: 10.10.10.0/24
     crczp_mgmt_cidr: 192.168.128.0/17          # CRCZP provisioning uses this subnet, it must be allowed
@@ -263,7 +264,21 @@
         shell: /usr/sbin/nologin
         create_home: false
 
+    - name: Create local fileserver-admin account
+      ansible.builtin.user:
+        name: "{{ smb_admin }}"
+        groups: "{{ corp_files_group }}"
+        append: true
+        shell: /usr/sbin/nologin
+        create_home: false
+
     - name: Set Samba password for fileserver account
+      ansible.builtin.shell: |
+        (echo "{{ smb_password }}"; echo "{{ smb_password }}") | smbpasswd -s -a "{{ smb_user }}"
+      no_log: true
+      changed_when: true
+
+    - name: Set Samba password for fileserver-admin
       ansible.builtin.shell: |
         (echo "{{ smb_password }}"; echo "{{ smb_password }}") | smbpasswd -s -a "{{ smb_user }}"
       no_log: true
@@ -271,6 +286,10 @@
 
     - name: Enable and unlock the Samba user
       ansible.builtin.command: smbpasswd -e "{{ smb_user }}"
+      changed_when: true
+
+    - name: Enable and unlock the Samba admin
+      ansible.builtin.command: smbpasswd -e "{{ smb_admin }}"
       changed_when: true
 
     - name: Configure Samba share

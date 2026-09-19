@@ -4,8 +4,8 @@ hosts:
   - name: enterprise-host-linux
     flavor: standard.small
     base_box:
-      image: ubuntu-20.04-server-cloudimg-amd64
-      mgmt_user: ubuntu
+      image: kali
+      mgmt_user: debian
   - name: attacker-host
     flavor: standard.small
     base_box:

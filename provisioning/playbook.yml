@@ -413,3 +413,52 @@
     - name: apply netplan
       ansible.builtin.command: netplan apply
       changed_when: true
+
+- name: Test 802.1Q VLAN sub-interface on enterprise-host-linux (proof of concept)
+  hosts: enterprise-host-linux
+  become: true
+  vars:
+    # The IP CRCZP already assigned to this host on enterprise-host-net (per net_mappings)
+    vlan_parent_ip: 10.10.10.10
+    test_vlan_id: 10
+    test_vlan_cidr: 10.10.10.251/26   # distinct from both the host's own untagged .10 and the router's tagged .250
+
+  tasks:
+    - name: Gather current facts
+      ansible.builtin.setup:
+
+    - name: Identify the physical interface currently holding {{ vlan_parent_ip }}
+      ansible.builtin.set_fact:
+        vlan_parent_iface: "{{ item }}"
+      loop: "{{ ansible_facts.interfaces }}"
+      when: >
+        ansible_facts[item] is defined and
+        ansible_facts[item].ipv4 is defined and
+        ansible_facts[item].ipv4.address == vlan_parent_ip
+
+    - name: Fail early if the parent interface could not be identified
+      ansible.builtin.fail:
+        msg: "Could not find an interface holding {{ vlan_parent_ip }} - check vlan_parent_ip."
+      when: vlan_parent_iface is not defined
+
+    - name: Write a standalone netplan drop-in for the test VLAN sub-interface
+      ansible.builtin.copy:
+        dest: /etc/netplan/91-test-vlan.yaml
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          network:
+            version: 2
+            vlans:
+              {{ vlan_parent_iface }}.{{ test_vlan_id }}:
+                id: {{ test_vlan_id }}
+                link: {{ vlan_parent_iface }}
+                addresses:
+                  - {{ test_vlan_cidr }}
+      notify: apply netplan
+
+  handlers:
+    - name: apply netplan
+      ansible.builtin.command: netplan apply
+      changed_when: true

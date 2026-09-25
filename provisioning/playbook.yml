@@ -418,10 +418,9 @@
   hosts: enterprise-host-linux
   become: true
   vars:
-    # The IP CRCZP already assigned to this host on enterprise-host-net (per net_mappings)
     vlan_parent_ip: 10.10.10.10
     test_vlan_id: 10
-    test_vlan_cidr: 10.10.10.251/26   # distinct from both the host's own untagged .10 and the router's tagged .250
+    test_vlan_cidr: 10.10.10.251/26
 
   tasks:
     - name: Gather current facts
@@ -441,24 +440,24 @@
         msg: "Could not find an interface holding {{ vlan_parent_ip }} - check vlan_parent_ip."
       when: vlan_parent_iface is not defined
 
-    - name: Write a standalone netplan drop-in for the test VLAN sub-interface
-      ansible.builtin.copy:
-        dest: /etc/netplan/91-test-vlan.yaml
-        owner: root
-        group: root
-        mode: "0600"
-        content: |
-          network:
-            version: 2
-            vlans:
-              {{ vlan_parent_iface }}.{{ test_vlan_id }}:
-                id: {{ test_vlan_id }}
-                link: {{ vlan_parent_iface }}
-                addresses:
-                  - {{ test_vlan_cidr }}
-      notify: apply netplan
+    - name: Ensure the 8021q kernel module is loaded
+      ansible.builtin.command: modprobe 8021q
+      args:
+        creates: /sys/module/8021q
 
-  handlers:
-    - name: apply netplan
-      ansible.builtin.command: netplan apply
+    - name: Create the VLAN sub-interface
+      ansible.builtin.command:
+        cmd: "ip link add link {{ vlan_parent_iface }} name {{ vlan_parent_iface }}.{{ test_vlan_id }} type vlan id {{ test_vlan_id }}"
+        creates: "/sys/class/net/{{ vlan_parent_iface }}.{{ test_vlan_id }}"
+
+    - name: Bring the VLAN sub-interface up
+      ansible.builtin.command:
+        cmd: "ip link set {{ vlan_parent_iface }}.{{ test_vlan_id }} up"
       changed_when: true
+
+    - name: Assign the test address to the VLAN sub-interface
+      ansible.builtin.command:
+        cmd: "ip addr add {{ test_vlan_cidr }} dev {{ vlan_parent_iface }}.{{ test_vlan_id }}"
+      register: vlan_addr
+      failed_when: vlan_addr.rc != 0 and 'File exists' not in vlan_addr.stderr
+      changed_when: vlan_addr.rc == 0

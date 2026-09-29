@@ -408,23 +408,26 @@
     vxlan_id: 100
     vxlan_dstport: 4789
     trunk_bridge: br-trunk
-    test_vlan_id: 10
+    trunk_mtu: 1400
     vxlan_nodes:
       enterprise-router:
         real_ip: 10.10.10.1
-        vlan_test_cidr: 10.10.10.252/26
+        vlan10_cidr: 172.16.99.1/30
+        vlan20_cidr: 172.16.99.5/30
       enterprise-host-linux:
         real_ip: 10.10.10.10
-        vlan_test_cidr: 10.10.10.253/26
+        vlan10_cidr: 172.16.99.2/30
+        vlan20_cidr: 172.16.99.6/30
 
   tasks:
     - name: Gather current facts
       ansible.builtin.setup:
 
-    - name: Determine this node's real IP and test VLAN address
+    - name: Determine this node's real IP and test VLAN addresses
       ansible.builtin.set_fact:
         my_real_ip: "{{ vxlan_nodes[inventory_hostname].real_ip }}"
-        my_vlan_test_cidr: "{{ vxlan_nodes[inventory_hostname].vlan_test_cidr }}"
+        my_vlan10_cidr: "{{ vxlan_nodes[inventory_hostname].vlan10_cidr }}"
+        my_vlan20_cidr: "{{ vxlan_nodes[inventory_hostname].vlan20_cidr }}"
 
     - name: Determine the peer node's real IP
       ansible.builtin.set_fact:
@@ -459,6 +462,10 @@
           remote {{ peer_real_ip }} dstport {{ vxlan_dstport }} dev {{ vlan_parent_iface }}
         creates: "/sys/class/net/{{ trunk_bridge }}-vxlan"
 
+    - name: Set MTU on the VXLAN interface
+      ansible.builtin.command: "ip link set {{ trunk_bridge }}-vxlan mtu {{ trunk_mtu }}"
+      changed_when: true
+
     - name: Bring the VXLAN interface up
       ansible.builtin.command: "ip link set {{ trunk_bridge }}-vxlan up"
       changed_when: true
@@ -476,17 +483,29 @@
       ansible.builtin.command: "ip link set {{ trunk_bridge }} up"
       changed_when: true
 
-    - name: Create the tagged VLAN sub-interface on top of the trunk bridge
+    - name: Create tagged VLAN sub-interfaces (10 and 20) on top of the trunk bridge
       ansible.builtin.command:
-        cmd: "ip link add link {{ trunk_bridge }} name {{ trunk_bridge }}.{{ test_vlan_id }} type vlan id {{ test_vlan_id }}"
-        creates: "/sys/class/net/{{ trunk_bridge }}.{{ test_vlan_id }}"
+        cmd: "ip link add link {{ trunk_bridge }} name {{ trunk_bridge }}.{{ item }} type vlan id {{ item }}"
+        creates: "/sys/class/net/{{ trunk_bridge }}.{{ item }}"
+      loop:
+        - 10
+        - 20
 
-    - name: Bring the tagged VLAN sub-interface up
-      ansible.builtin.command: "ip link set {{ trunk_bridge }}.{{ test_vlan_id }} up"
+    - name: Set MTU and bring each tagged sub-interface up
+      ansible.builtin.command: "ip link set {{ trunk_bridge }}.{{ item }} mtu {{ trunk_mtu }} up"
       changed_when: true
+      loop:
+        - 10
+        - 20
 
-    - name: Assign the test address to the tagged VLAN sub-interface
-      ansible.builtin.command: "ip addr add {{ my_vlan_test_cidr }} dev {{ trunk_bridge }}.{{ test_vlan_id }}"
-      register: vlan_addr
-      failed_when: vlan_addr.rc != 0 and 'File exists' not in vlan_addr.stderr
-      changed_when: vlan_addr.rc == 0
+    - name: Assign test addresses to VLAN 10
+      ansible.builtin.command: "ip addr add {{ my_vlan10_cidr }} dev {{ trunk_bridge }}.10"
+      register: vlan10_addr
+      failed_when: vlan10_addr.rc != 0 and 'File exists' not in vlan10_addr.stderr
+      changed_when: vlan10_addr.rc == 0
+
+    - name: Assign test addresses to VLAN 20
+      ansible.builtin.command: "ip addr add {{ my_vlan20_cidr }} dev {{ trunk_bridge }}.20"
+      register: vlan20_addr
+      failed_when: vlan20_addr.rc != 0 and 'File exists' not in vlan20_addr.stderr
+      changed_when: vlan20_addr.rc == 0

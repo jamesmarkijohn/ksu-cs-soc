@@ -400,3 +400,93 @@
     - name: Save iptables rules
       ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
       changed_when: false
+
+- name: VXLAN overlay for 802.1Q trunking between enterprise-router and enterprise-host-linux (proof of concept)
+  hosts: enterprise-router:enterprise-host-linux
+  become: true
+  vars:
+    vxlan_id: 100
+    vxlan_dstport: 4789
+    trunk_bridge: br-trunk
+    test_vlan_id: 10
+    vxlan_nodes:
+      enterprise-router:
+        real_ip: 10.10.10.1
+        vlan_test_cidr: 10.10.10.252/26
+      enterprise-host-linux:
+        real_ip: 10.10.10.10
+        vlan_test_cidr: 10.10.10.253/26
+
+  tasks:
+    - name: Gather current facts
+      ansible.builtin.setup:
+
+    - name: Determine this node's real IP and test VLAN address
+      ansible.builtin.set_fact:
+        my_real_ip: "{{ vxlan_nodes[inventory_hostname].real_ip }}"
+        my_vlan_test_cidr: "{{ vxlan_nodes[inventory_hostname].vlan_test_cidr }}"
+
+    - name: Determine the peer node's real IP
+      ansible.builtin.set_fact:
+        peer_real_ip: "{{ vxlan_nodes[(vxlan_nodes.keys() | list | difference([inventory_hostname]))[0]].real_ip }}"
+
+    - name: Identify the physical interface currently holding {{ my_real_ip }}
+      ansible.builtin.set_fact:
+        vlan_parent_iface: "{{ item }}"
+      loop: "{{ ansible_facts.interfaces }}"
+      when: >
+        ansible_facts[item] is defined and
+        ansible_facts[item].ipv4 is defined and
+        ansible_facts[item].ipv4.address == my_real_ip
+
+    - name: Fail early if the parent interface could not be identified
+      ansible.builtin.fail:
+        msg: "Could not find an interface holding {{ my_real_ip }} - check vxlan_nodes."
+      when: vlan_parent_iface is not defined
+
+    - name: Ensure the vxlan and 8021q kernel modules are loaded
+      ansible.builtin.command: "modprobe {{ item }}"
+      args:
+        creates: "/sys/module/{{ item }}"
+      loop:
+        - vxlan
+        - 8021q
+
+    - name: Create the VXLAN tunnel to the peer
+      ansible.builtin.command:
+        cmd: >
+          ip link add {{ trunk_bridge }}-vxlan type vxlan id {{ vxlan_id }}
+          remote {{ peer_real_ip }} dstport {{ vxlan_dstport }} dev {{ vlan_parent_iface }}
+        creates: "/sys/class/net/{{ trunk_bridge }}-vxlan"
+
+    - name: Bring the VXLAN interface up
+      ansible.builtin.command: "ip link set {{ trunk_bridge }}-vxlan up"
+      changed_when: true
+
+    - name: Create the trunk bridge
+      ansible.builtin.command:
+        cmd: "ip link add name {{ trunk_bridge }} type bridge"
+        creates: "/sys/class/net/{{ trunk_bridge }}"
+
+    - name: Attach the VXLAN tunnel to the trunk bridge
+      ansible.builtin.command: "ip link set {{ trunk_bridge }}-vxlan master {{ trunk_bridge }}"
+      changed_when: true
+
+    - name: Bring the trunk bridge up
+      ansible.builtin.command: "ip link set {{ trunk_bridge }} up"
+      changed_when: true
+
+    - name: Create the tagged VLAN sub-interface on top of the trunk bridge
+      ansible.builtin.command:
+        cmd: "ip link add link {{ trunk_bridge }} name {{ trunk_bridge }}.{{ test_vlan_id }} type vlan id {{ test_vlan_id }}"
+        creates: "/sys/class/net/{{ trunk_bridge }}.{{ test_vlan_id }}"
+
+    - name: Bring the tagged VLAN sub-interface up
+      ansible.builtin.command: "ip link set {{ trunk_bridge }}.{{ test_vlan_id }} up"
+      changed_when: true
+
+    - name: Assign the test address to the tagged VLAN sub-interface
+      ansible.builtin.command: "ip addr add {{ my_vlan_test_cidr }} dev {{ trunk_bridge }}.{{ test_vlan_id }}"
+      register: vlan_addr
+      failed_when: vlan_addr.rc != 0 and 'File exists' not in vlan_addr.stderr
+      changed_when: vlan_addr.rc == 0

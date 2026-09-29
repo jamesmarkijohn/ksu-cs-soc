@@ -365,99 +365,38 @@
         name: smbd
         state: restarted
 
-- name: Test 802.1Q VLAN sub-interface on enterprise-router (proof of concept)
-  hosts: enterprise-router
+- name: Enforce isolation between attacker-net and enterprise/SOC networks
+  hosts: enterprise-router:attacker-router
   become: true
   vars:
-    # The IP CRCZP already assigned to the enterprise-host-net interface (per router_mappings)
-    vlan_parent_ip: 10.10.10.1
-    test_vlan_id: 10
-    test_vlan_cidr: 10.10.10.250/26   # unused address inside enterprise-host-net, just to bring the tagged iface up
+    attacker_cidr: 192.168.1.0/24
+    enterprise_cidr: 10.10.10.0/24   # covers enterprise-host-net, enterprise-prod-net, and soc-net
 
   tasks:
-    - name: Gather current facts
-      ansible.builtin.setup:
+    - name: Ensure iptables-persistent is installed
+      ansible.builtin.apt:
+        name: iptables-persistent
+        state: present
+        update_cache: true
 
-    - name: Identify the physical interface currently holding {{ vlan_parent_ip }}
-      ansible.builtin.set_fact:
-        vlan_parent_iface: "{{ item }}"
-      loop: "{{ ansible_facts.interfaces }}"
-      when: >
-        ansible_facts[item] is defined and
-        ansible_facts[item].ipv4 is defined and
-        ansible_facts[item].ipv4.address == vlan_parent_ip
+    - name: Drop forwarded traffic from attacker-net to enterprise/SOC network
+      ansible.builtin.iptables:
+        chain: FORWARD
+        protocol: all
+        source: "{{ attacker_cidr }}"
+        destination: "{{ enterprise_cidr }}"
+        jump: DROP
+        comment: "Isolate attacker-net from enterprise/SOC network"
 
-    - name: Fail early if the parent interface could not be identified
-      ansible.builtin.fail:
-        msg: "Could not find an interface holding {{ vlan_parent_ip }} - check vlan_parent_ip."
-      when: vlan_parent_iface is not defined
+    - name: Drop forwarded traffic from enterprise/SOC network to attacker-net
+      ansible.builtin.iptables:
+        chain: FORWARD
+        protocol: all
+        source: "{{ enterprise_cidr }}"
+        destination: "{{ attacker_cidr }}"
+        jump: DROP
+        comment: "Isolate enterprise/SOC network from attacker-net"
 
-    - name: Write a standalone netplan drop-in for the test VLAN sub-interface
-      ansible.builtin.copy:
-        dest: /etc/netplan/91-test-vlan.yaml
-        owner: root
-        group: root
-        mode: "0600"
-        content: |
-          network:
-            version: 2
-            vlans:
-              {{ vlan_parent_iface }}.{{ test_vlan_id }}:
-                id: {{ test_vlan_id }}
-                link: {{ vlan_parent_iface }}
-                addresses:
-                  - {{ test_vlan_cidr }}
-      notify: apply netplan
-
-  handlers:
-    - name: apply netplan
-      ansible.builtin.command: netplan apply
-      changed_when: true
-
-- name: Test 802.1Q VLAN sub-interface on enterprise-host-linux (proof of concept)
-  hosts: enterprise-host-linux
-  become: true
-  vars:
-    vlan_parent_ip: 10.10.10.10
-    test_vlan_id: 10
-    test_vlan_cidr: 10.10.10.251/26
-
-  tasks:
-    - name: Gather current facts
-      ansible.builtin.setup:
-
-    - name: Identify the physical interface currently holding {{ vlan_parent_ip }}
-      ansible.builtin.set_fact:
-        vlan_parent_iface: "{{ item }}"
-      loop: "{{ ansible_facts.interfaces }}"
-      when: >
-        ansible_facts[item] is defined and
-        ansible_facts[item].ipv4 is defined and
-        ansible_facts[item].ipv4.address == vlan_parent_ip
-
-    - name: Fail early if the parent interface could not be identified
-      ansible.builtin.fail:
-        msg: "Could not find an interface holding {{ vlan_parent_ip }} - check vlan_parent_ip."
-      when: vlan_parent_iface is not defined
-
-    - name: Ensure the 8021q kernel module is loaded
-      ansible.builtin.command: modprobe 8021q
-      args:
-        creates: /sys/module/8021q
-
-    - name: Create the VLAN sub-interface
-      ansible.builtin.command:
-        cmd: "ip link add link {{ vlan_parent_iface }} name {{ vlan_parent_iface }}.{{ test_vlan_id }} type vlan id {{ test_vlan_id }}"
-        creates: "/sys/class/net/{{ vlan_parent_iface }}.{{ test_vlan_id }}"
-
-    - name: Bring the VLAN sub-interface up
-      ansible.builtin.command:
-        cmd: "ip link set {{ vlan_parent_iface }}.{{ test_vlan_id }} up"
-      changed_when: true
-
-    - name: Assign the test address to the VLAN sub-interface
-      ansible.builtin.command:
-        cmd: "ip addr add {{ test_vlan_cidr }} dev {{ vlan_parent_iface }}.{{ test_vlan_id }}"
-      register: vlan_addr
-      failed_when: vlan_addr.rc != 0 and 'File exists' not in vlan_addr.stderr
-      changed_when: vlan_addr.rc == 0
+    - name: Save iptables rules
+      ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
+      changed_when: false

@@ -520,8 +520,8 @@
       ansible.builtin.iptables:
         chain: FORWARD
         protocol: all
-        source: 172.16.99.0/30
-        destination: 172.16.99.4/30
+        source: 172.16.99.0/29
+        destination: 172.16.99.8/29
         jump: DROP
         comment: "Isolate VLAN 10 from VLAN 20"
       when: inventory_hostname == 'enterprise-router'
@@ -530,10 +530,30 @@
       ansible.builtin.iptables:
         chain: FORWARD
         protocol: all
-        source: 172.16.99.4/30
-        destination: 172.16.99.0/30
+        source: 172.16.99.8/29
+        destination: 172.16.99.0/29
         jump: DROP
         comment: "Isolate VLAN 20 from VLAN 10"
+      when: inventory_hostname == 'enterprise-router'
+
+    - name: Drop locally-originated traffic from VLAN 10 to VLAN 20 (router's own traffic)
+      ansible.builtin.iptables:
+        chain: OUTPUT
+        protocol: all
+        source: 172.16.99.0/29
+        destination: 172.16.99.8/29
+        jump: DROP
+        comment: "Isolate VLAN 10 from VLAN 20 (router-originated)"
+      when: inventory_hostname == 'enterprise-router'
+
+    - name: Drop locally-originated traffic from VLAN 20 to VLAN 10 (router's own traffic)
+      ansible.builtin.iptables:
+        chain: OUTPUT
+        protocol: all
+        source: 172.16.99.8/29
+        destination: 172.16.99.0/29
+        jump: DROP
+        comment: "Isolate VLAN 20 from VLAN 10 (router-originated)"
       when: inventory_hostname == 'enterprise-router'
 
     - name: Save iptables rules

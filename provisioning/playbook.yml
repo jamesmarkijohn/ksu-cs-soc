@@ -509,3 +509,34 @@
       register: vlan20_addr
       failed_when: vlan20_addr.rc != 0 and 'File exists' not in vlan20_addr.stderr
       changed_when: vlan20_addr.rc == 0
+
+    - name: Ensure iptables-persistent is installed (for VLAN isolation rules)
+      ansible.builtin.apt:
+        name: iptables-persistent
+        state: present
+      when: inventory_hostname == 'enterprise-router'
+
+    - name: Drop forwarded traffic from VLAN 10 to VLAN 20
+      ansible.builtin.iptables:
+        chain: FORWARD
+        protocol: all
+        source: 172.16.99.0/30
+        destination: 172.16.99.4/30
+        jump: DROP
+        comment: "Isolate VLAN 10 from VLAN 20"
+      when: inventory_hostname == 'enterprise-router'
+
+    - name: Drop forwarded traffic from VLAN 20 to VLAN 10
+      ansible.builtin.iptables:
+        chain: FORWARD
+        protocol: all
+        source: 172.16.99.4/30
+        destination: 172.16.99.0/30
+        jump: DROP
+        comment: "Isolate VLAN 20 from VLAN 10"
+      when: inventory_hostname == 'enterprise-router'
+
+    - name: Save iptables rules
+      ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
+      changed_when: false
+      when: inventory_hostname == 'enterprise-router'

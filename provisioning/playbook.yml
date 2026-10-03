@@ -412,12 +412,12 @@
     vxlan_nodes:
       enterprise-router:
         real_ip: 10.10.10.1
-        vlan10_cidr: 172.16.99.1/30
-        vlan20_cidr: 172.16.99.5/30
+        vlan10_cidr: 172.16.99.1/29
+        vlan20_cidr: 172.16.99.9/29
       enterprise-host-linux:
         real_ip: 10.10.10.10
-        vlan10_cidr: 172.16.99.2/30
-        vlan20_cidr: 172.16.99.6/30
+        vlan10_cidr: 172.16.99.2/29
+        vlan20_cidr: 172.16.99.10/29
 
   tasks:
     - name: Gather current facts

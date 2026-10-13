@@ -365,198 +365,150 @@
         name: smbd
         state: restarted
 
-- name: Enforce isolation between attacker-net and enterprise/SOC networks
-  hosts: enterprise-router:attacker-router
+- name: VLAN trunk overlay (hub-and-spoke VXLAN + 802.1Q, persistent)
+  hosts: enterprise-router:enterprise-host-linux:enterprise-web:enterprise-app:enterprise-db:enterprise-file:enterprise-auth:soc-host
   become: true
   vars:
-    attacker_cidr: 192.168.1.0/24
-    enterprise_cidr: 10.10.10.0/24   # covers enterprise-host-net, enterprise-prod-net, and soc-net
+    trunk_hub: enterprise-router
+    trunk_dstport: 4789
+    trunk_mtu: 1400        # tunnel and bridge MTU (underlay 1450 minus 50)
+    trunk_vlan_mtu: 1396   # VLAN interfaces (4 bytes less for the 802.1Q tag)
+    trunk_vlans: [10, 20, 30]
+    # vid 10 = enterprise hosts, 20 = servers, 30 = SOC
+    # hub_ip = the router's own address on the spoke's real network
+    # addr = overlay address (third octet = VLAN ID, last octet = real IP's last octet)
+    trunk_spokes:
+      enterprise-host-linux: {vni: 101, vid: 10, short: host, real_ip: 10.10.10.10,  hub_ip: 10.10.10.1,   addr: 172.16.10.10}
+      enterprise-web:        {vni: 102, vid: 20, short: web,  real_ip: 10.10.10.66,  hub_ip: 10.10.10.65,  addr: 172.16.20.66}
+      enterprise-app:        {vni: 103, vid: 20, short: app,  real_ip: 10.10.10.67,  hub_ip: 10.10.10.65,  addr: 172.16.20.67}
+      enterprise-db:         {vni: 104, vid: 20, short: db,   real_ip: 10.10.10.68,  hub_ip: 10.10.10.65,  addr: 172.16.20.68}
+      enterprise-file:       {vni: 105, vid: 20, short: file, real_ip: 10.10.10.69,  hub_ip: 10.10.10.65,  addr: 172.16.20.69}
+      enterprise-auth:       {vni: 106, vid: 20, short: auth, real_ip: 10.10.10.70,  hub_ip: 10.10.10.65,  addr: 172.16.20.70}
+      soc-host:              {vni: 107, vid: 30, short: soc,  real_ip: 10.10.10.200, hub_ip: 10.10.10.129, addr: 172.16.30.200}
 
   tasks:
-    - name: Ensure iptables-persistent is installed
+    - name: Write the hub overlay script (VLAN-aware bridge + one tunnel per spoke)
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/vlan-overlay.sh
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          # Managed by Ansible: VLAN trunk hub on {{ inventory_hostname }}
+          modprobe vxlan 2>/dev/null
+          modprobe 8021q 2>/dev/null
+          wait_for_ip() {
+            n=0
+            while ! ip -o -4 addr show | grep -q " $1/"; do
+              n=$((n+1))
+              [ "$n" -gt 60 ] && return 1
+              sleep 1
+            done
+          }
+          {% for spoke in trunk_spokes.values() %}
+          ip link del vx-{{ spoke.short }} 2>/dev/null
+          {% endfor %}
+          ip link del br-trunk 2>/dev/null
+          ip link add br-trunk type bridge vlan_filtering 1
+          ip link set br-trunk mtu {{ trunk_mtu }} up
+          {% for spoke in trunk_spokes.values() %}
+          wait_for_ip {{ spoke.hub_ip }} || echo "timeout waiting for {{ spoke.hub_ip }}" >&2
+          ip link add vx-{{ spoke.short }} type vxlan id {{ spoke.vni }} local {{ spoke.hub_ip }} remote {{ spoke.real_ip }} dstport {{ trunk_dstport }}
+          ip link set vx-{{ spoke.short }} mtu {{ trunk_mtu }} master br-trunk up
+          bridge vlan del dev vx-{{ spoke.short }} vid 1
+          bridge vlan add dev vx-{{ spoke.short }} vid {{ spoke.vid }}
+          {% endfor %}
+          {% for vid in trunk_vlans %}
+          bridge vlan add dev br-trunk vid {{ vid }} self
+          ip link add link br-trunk name br-trunk.{{ vid }} type vlan id {{ vid }}
+          ip link set br-trunk.{{ vid }} mtu {{ trunk_vlan_mtu }} up
+          ip addr add 172.16.{{ vid }}.1/24 dev br-trunk.{{ vid }}
+          {% endfor %}
+      when: inventory_hostname == trunk_hub
+      notify: restart vlan-overlay
+
+    - name: Write the spoke overlay script (one tunnel to the hub + VLAN sub-interface)
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/vlan-overlay.sh
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          # Managed by Ansible: VLAN trunk spoke on {{ inventory_hostname }}
+          {% set me = trunk_spokes[inventory_hostname] %}
+          modprobe vxlan 2>/dev/null
+          modprobe 8021q 2>/dev/null
+          wait_for_ip() {
+            n=0
+            while ! ip -o -4 addr show | grep -q " $1/"; do
+              n=$((n+1))
+              [ "$n" -gt 60 ] && return 1
+              sleep 1
+            done
+          }
+          wait_for_ip {{ me.real_ip }} || exit 1
+          ip link del vxlan-trunk 2>/dev/null
+          ip link add vxlan-trunk type vxlan id {{ me.vni }} local {{ me.real_ip }} remote {{ me.hub_ip }} dstport {{ trunk_dstport }}
+          ip link set vxlan-trunk mtu {{ trunk_mtu }} up
+          ip link add link vxlan-trunk name vxlan-trunk.{{ me.vid }} type vlan id {{ me.vid }}
+          ip link set vxlan-trunk.{{ me.vid }} mtu {{ trunk_vlan_mtu }} up
+          ip addr add {{ me.addr }}/24 dev vxlan-trunk.{{ me.vid }}
+          ip route add 172.16.0.0/16 via 172.16.{{ me.vid }}.1 dev vxlan-trunk.{{ me.vid }}
+      when: inventory_hostname != trunk_hub
+      notify: restart vlan-overlay
+
+    - name: Install the boot-time service that rebuilds the overlay
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/vlan-overlay.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=VLAN trunk overlay (VXLAN + 802.1Q)
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/local/sbin/vlan-overlay.sh
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: restart vlan-overlay
+
+    - name: Enable the overlay service at boot
+      ansible.builtin.systemd:
+        name: vlan-overlay
+        enabled: true
+        daemon_reload: true
+
+    - name: Ensure iptables-persistent is installed on the hub
       ansible.builtin.apt:
         name: iptables-persistent
         state: present
         update_cache: true
+      when: inventory_hostname == trunk_hub
 
-    - name: Drop forwarded traffic from attacker-net to enterprise/SOC network
+    - name: Drop routed traffic between VLAN interfaces
       ansible.builtin.iptables:
         chain: FORWARD
-        protocol: all
-        source: "{{ attacker_cidr }}"
-        destination: "{{ enterprise_cidr }}"
+        in_interface: "br-trunk.+"
+        out_interface: "br-trunk.+"
         jump: DROP
-        comment: "Isolate attacker-net from enterprise/SOC network"
-
-    - name: Drop forwarded traffic from enterprise/SOC network to attacker-net
-      ansible.builtin.iptables:
-        chain: FORWARD
-        protocol: all
-        source: "{{ enterprise_cidr }}"
-        destination: "{{ attacker_cidr }}"
-        jump: DROP
-        comment: "Isolate enterprise/SOC network from attacker-net"
+        comment: "Isolate VLANs from each other"
+      when: inventory_hostname == trunk_hub
 
     - name: Save iptables rules
       ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
       changed_when: false
+      when: inventory_hostname == trunk_hub
 
-- name: VXLAN overlay for 802.1Q trunking between enterprise-router and enterprise-host-linux (proof of concept)
-  hosts: enterprise-router:enterprise-host-linux
-  become: true
-  vars:
-    vxlan_id: 100
-    vxlan_dstport: 4789
-    trunk_bridge: br-trunk
-    trunk_mtu: 1400
-    vxlan_nodes:
-      enterprise-router:
-        real_ip: 10.10.10.1
-        vlan10_cidr: 172.16.99.1/29
-        vlan20_cidr: 172.16.99.9/29
-      enterprise-host-linux:
-        real_ip: 10.10.10.10
-        vlan10_cidr: 172.16.99.2/29
-        vlan20_cidr: 172.16.99.10/29
-
-  tasks:
-    - name: Gather current facts
-      ansible.builtin.setup:
-
-    - name: Determine this node's real IP and test VLAN addresses
-      ansible.builtin.set_fact:
-        my_real_ip: "{{ vxlan_nodes[inventory_hostname].real_ip }}"
-        my_vlan10_cidr: "{{ vxlan_nodes[inventory_hostname].vlan10_cidr }}"
-        my_vlan20_cidr: "{{ vxlan_nodes[inventory_hostname].vlan20_cidr }}"
-
-    - name: Determine the peer node's real IP
-      ansible.builtin.set_fact:
-        peer_real_ip: "{{ vxlan_nodes[(vxlan_nodes.keys() | list | difference([inventory_hostname]))[0]].real_ip }}"
-
-    - name: Identify the physical interface currently holding {{ my_real_ip }}
-      ansible.builtin.set_fact:
-        vlan_parent_iface: "{{ item }}"
-      loop: "{{ ansible_facts.interfaces }}"
-      when: >
-        ansible_facts[item] is defined and
-        ansible_facts[item].ipv4 is defined and
-        ansible_facts[item].ipv4.address == my_real_ip
-
-    - name: Fail early if the parent interface could not be identified
-      ansible.builtin.fail:
-        msg: "Could not find an interface holding {{ my_real_ip }} - check vxlan_nodes."
-      when: vlan_parent_iface is not defined
-
-    - name: Ensure the vxlan and 8021q kernel modules are loaded
-      ansible.builtin.command: "modprobe {{ item }}"
-      args:
-        creates: "/sys/module/{{ item }}"
-      loop:
-        - vxlan
-        - 8021q
-
-    - name: Create the VXLAN tunnel to the peer
-      ansible.builtin.command:
-        cmd: >
-          ip link add {{ trunk_bridge }}-vxlan type vxlan id {{ vxlan_id }}
-          remote {{ peer_real_ip }} dstport {{ vxlan_dstport }} dev {{ vlan_parent_iface }}
-        creates: "/sys/class/net/{{ trunk_bridge }}-vxlan"
-
-    - name: Set MTU on the VXLAN interface
-      ansible.builtin.command: "ip link set {{ trunk_bridge }}-vxlan mtu {{ trunk_mtu }}"
-      changed_when: true
-
-    - name: Bring the VXLAN interface up
-      ansible.builtin.command: "ip link set {{ trunk_bridge }}-vxlan up"
-      changed_when: true
-
-    - name: Create the trunk bridge
-      ansible.builtin.command:
-        cmd: "ip link add name {{ trunk_bridge }} type bridge"
-        creates: "/sys/class/net/{{ trunk_bridge }}"
-
-    - name: Attach the VXLAN tunnel to the trunk bridge
-      ansible.builtin.command: "ip link set {{ trunk_bridge }}-vxlan master {{ trunk_bridge }}"
-      changed_when: true
-
-    - name: Bring the trunk bridge up
-      ansible.builtin.command: "ip link set {{ trunk_bridge }} up"
-      changed_when: true
-
-    - name: Create tagged VLAN sub-interfaces (10 and 20) on top of the trunk bridge
-      ansible.builtin.command:
-        cmd: "ip link add link {{ trunk_bridge }} name {{ trunk_bridge }}.{{ item }} type vlan id {{ item }}"
-        creates: "/sys/class/net/{{ trunk_bridge }}.{{ item }}"
-      loop:
-        - 10
-        - 20
-
-    - name: Set MTU and bring each tagged sub-interface up
-      ansible.builtin.command: "ip link set {{ trunk_bridge }}.{{ item }} mtu {{ trunk_mtu }} up"
-      changed_when: true
-      loop:
-        - 10
-        - 20
-
-    - name: Assign test addresses to VLAN 10
-      ansible.builtin.command: "ip addr add {{ my_vlan10_cidr }} dev {{ trunk_bridge }}.10"
-      register: vlan10_addr
-      failed_when: vlan10_addr.rc != 0 and 'File exists' not in vlan10_addr.stderr
-      changed_when: vlan10_addr.rc == 0
-
-    - name: Assign test addresses to VLAN 20
-      ansible.builtin.command: "ip addr add {{ my_vlan20_cidr }} dev {{ trunk_bridge }}.20"
-      register: vlan20_addr
-      failed_when: vlan20_addr.rc != 0 and 'File exists' not in vlan20_addr.stderr
-      changed_when: vlan20_addr.rc == 0
-
-    - name: Ensure iptables-persistent is installed (for VLAN isolation rules)
-      ansible.builtin.apt:
-        name: iptables-persistent
-        state: present
-      when: inventory_hostname == 'enterprise-router'
-
-    - name: Drop forwarded traffic from VLAN 10 to VLAN 20
-      ansible.builtin.iptables:
-        chain: FORWARD
-        protocol: all
-        source: 172.16.99.0/29
-        destination: 172.16.99.8/29
-        jump: DROP
-        comment: "Isolate VLAN 10 from VLAN 20"
-      when: inventory_hostname == 'enterprise-router'
-
-    - name: Drop forwarded traffic from VLAN 20 to VLAN 10
-      ansible.builtin.iptables:
-        chain: FORWARD
-        protocol: all
-        source: 172.16.99.8/29
-        destination: 172.16.99.0/29
-        jump: DROP
-        comment: "Isolate VLAN 20 from VLAN 10"
-      when: inventory_hostname == 'enterprise-router'
-
-    - name: Drop locally-originated traffic from VLAN 10 to VLAN 20 (router's own traffic)
-      ansible.builtin.iptables:
-        chain: OUTPUT
-        protocol: all
-        source: 172.16.99.0/29
-        destination: 172.16.99.8/29
-        jump: DROP
-        comment: "Isolate VLAN 10 from VLAN 20 (router-originated)"
-      when: inventory_hostname == 'enterprise-router'
-
-    - name: Drop locally-originated traffic from VLAN 20 to VLAN 10 (router's own traffic)
-      ansible.builtin.iptables:
-        chain: OUTPUT
-        protocol: all
-        source: 172.16.99.8/29
-        destination: 172.16.99.0/29
-        jump: DROP
-        comment: "Isolate VLAN 20 from VLAN 10 (router-originated)"
-      when: inventory_hostname == 'enterprise-router'
-
-    - name: Save iptables rules
-      ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
-      changed_when: false
-      when: inventory_hostname == 'enterprise-router'
+  handlers:
+    - name: restart vlan-overlay
+      ansible.builtin.systemd:
+        name: vlan-overlay
+        state: restarted

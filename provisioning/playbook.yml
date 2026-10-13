@@ -1,0 +1,514 @@
+---
+- name: Kali GUI via VNC (XFCE + TigerVNC) for Guacamole
+  hosts: attacker-host:soc-host:enterprise-host-linux
+  become: true
+  vars:
+    vnc_user: kali
+    kali_password: "nZIGzd7G&2"
+    vnc_password: "{{ (((kypo_global_sandbox_id | default(ansible_machine_id) | default(inventory_hostname)) ~ 'v73efn#woPs') | hash('sha1'))[:12] }}"
+    vnc_display: "1"
+    vnc_geometry: "1280x720"
+    vnc_depth: "24"
+    allow_vnc_nonlocal: true
+    vnc_localhost_flag: "{{ '-localhost no' if allow_vnc_nonlocal else '-localhost yes' }}"
+    vnc_cfg_dir: "/home/{{ vnc_user }}/.config/tigervnc"
+
+  handlers:
+    - name: restart ssh
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+
+  tasks:
+    - name: Ensure bootstrap SSH user exists (CRCZP key-based access)
+      ansible.builtin.user:
+        name: user
+        shell: /bin/bash
+        create_home: true
+        groups: sudo
+        append: true
+
+    - name: Allow CRCZP-generated SSH public key for bootstrap user
+      ansible.builtin.authorized_key:
+        user: user
+        state: present
+        key: "{{ lookup('file', global_ssh_public_user_key) }}"
+
+    - name: Allow passwordless sudo for bootstrap user (no password set)
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/90-crczp-bootstrap-user
+        owner: root
+        group: root
+        mode: "0440"
+        content: |
+          user ALL=(ALL) NOPASSWD:ALL
+
+    - name: Disable password-based SSH authentication
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/90-crczp-keyonly.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          ChallengeResponseAuthentication no
+          PubkeyAuthentication yes
+      notify: restart ssh
+
+    - name: Lock password login for default accounts (no default credentials)
+      ansible.builtin.user:
+        name: "{{ item }}"
+        password_lock: true
+      loop:
+        - "{{ vnc_user }}"
+        - root
+
+    - name: Set kali user login password
+      ansible.builtin.user:
+        name: "{{ vnc_user }}"
+        password: "{{ kali_password | password_hash('sha512') }}"
+
+    - name: Lock password login for root only (no default root credentials)
+      ansible.builtin.user:
+        name: root
+        password_lock: true
+
+    - name: Install XFCE + TigerVNC
+      ansible.builtin.apt:
+        update_cache: true
+        name:
+          - xfce4
+          - xfce4-goodies
+          - dbus-x11
+          - xauth
+          - tigervnc-standalone-server
+          - tigervnc-common
+        state: present
+
+    - name: Ensure TigerVNC config dir exists
+      ansible.builtin.file:
+        path: "{{ vnc_cfg_dir }}"
+        state: directory
+        owner: "{{ vnc_user }}"
+        group: "{{ vnc_user }}"
+        mode: "0700"
+
+    - name: Ensure ~/.vnc exists
+      ansible.builtin.file:
+        path: "/home/{{ vnc_user }}/.vnc"
+        state: directory
+        owner: "{{ vnc_user }}"
+        group: "{{ vnc_user }}"
+        mode: "0700"
+
+    - name: Set VNC password file
+      ansible.builtin.shell: |
+        set -euo pipefail
+        printf "%s\n" "{{ vnc_password }}" | vncpasswd -f > "{{ vnc_cfg_dir }}/passwd"
+        chown "{{ vnc_user }}:{{ vnc_user }}" "{{ vnc_cfg_dir }}/passwd"
+        chmod 0600 "{{ vnc_cfg_dir }}/passwd"
+      args:
+        executable: /bin/bash
+
+    - name: Set xstartup to launch XFCE (with dbus-launch)
+      ansible.builtin.copy:
+        dest: "{{ vnc_cfg_dir }}/xstartup"
+        owner: "{{ vnc_user }}"
+        group: "{{ vnc_user }}"
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          unset SESSION_MANAGER
+          unset DBUS_SESSION_BUS_ADDRESS
+          exec dbus-launch --exit-with-session startxfce4
+
+    - name: Remove stale VNC/X locks for display :{{ vnc_display }}
+      ansible.builtin.shell: |
+        rm -f /tmp/.X{{ vnc_display }}-lock /tmp/.X11-unix/X{{ vnc_display }} || true
+        rm -f /home/{{ vnc_user }}/.vnc/*:{{ vnc_display }}.pid || true
+        rm -f {{ vnc_cfg_dir }}/*:{{ vnc_display }}.pid || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Install vncserver@.service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/vncserver@.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=TigerVNC server on display :%i
+          After=network.target
+
+          [Service]
+          Type=simple
+          User={{ vnc_user }}
+          PAMName=login
+          WorkingDirectory=/home/{{ vnc_user }}
+
+          ExecStartPre=-/usr/bin/vncserver -kill :%i
+          ExecStart=/usr/bin/vncserver :%i -fg -geometry {{ vnc_geometry }} -depth {{ vnc_depth }} {{ vnc_localhost_flag }}
+          ExecStop=/usr/bin/vncserver -kill :%i
+
+          Restart=on-failure
+          RestartSec=2
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Start VNC on :{{ vnc_display }} (TCP 590{{ vnc_display }}) with diagnostics on failure
+      block:
+        - name: Start VNC service
+          ansible.builtin.systemd:
+            name: "vncserver@{{ vnc_display }}"
+            state: started
+            enabled: true
+
+      rescue:
+        - name: systemctl status vncserver@{{ vnc_display }}
+          ansible.builtin.command: "systemctl status vncserver@{{ vnc_display }} --no-pager -l"
+          register: vnc_status
+          changed_when: false
+          failed_when: false
+
+        - name: journalctl for vncserver@{{ vnc_display }}
+          ansible.builtin.command: "journalctl -xeu vncserver@{{ vnc_display }} --no-pager -n 200"
+          register: vnc_journal
+          changed_when: false
+          failed_when: false
+
+        - name: List ~/.vnc and ~/.config/tigervnc and show last 200 lines of logs
+          ansible.builtin.shell: |
+            set -e
+            echo "### ls -la /home/{{ vnc_user }}/.vnc"
+            ls -la /home/{{ vnc_user }}/.vnc || true
+            echo
+            echo "### ls -la {{ vnc_cfg_dir }}"
+            ls -la {{ vnc_cfg_dir }} || true
+            echo
+            echo "### tail of VNC logs (both locations)"
+            (ls -1 /home/{{ vnc_user }}/.vnc/*.log 2>/dev/null; ls -1 {{ vnc_cfg_dir }}/*.log 2>/dev/null) \
+              | sort -u | tail -n 10 | while read f; do
+                echo "----- $f -----"
+                tail -n 200 "$f" || true
+              done
+          args:
+            executable: /bin/bash
+          register: vnc_files
+          changed_when: false
+          failed_when: false
+
+        - name: Print diagnostics
+          ansible.builtin.debug:
+            msg: |
+              ===== systemctl status =====
+              {{ vnc_status.stdout | default('') }}
+              {{ vnc_status.stderr | default('') }}
+
+              ===== journalctl =====
+              {{ vnc_journal.stdout | default('') }}
+              {{ vnc_journal.stderr | default('') }}
+
+              ===== ~/.vnc + ~/.config/tigervnc logs =====
+              {{ vnc_files.stdout | default('') }}
+              {{ vnc_files.stderr | default('') }}
+
+        - name: Fail provisioning with captured diagnostics
+          ansible.builtin.fail:
+            msg: "VNC service failed to start; see diagnostics above."
+
+- name: Configure enterprise file server (SMB/Samba shared storage)
+  hosts: enterprise-file
+  become: true
+  vars:
+    corp_files_group: corpfiles
+    corp_files_path: /mnt/corp-files
+    smb_user: fileserver
+    smb_admin: fileserver-admin
+    smb_password: "ChangeMe-CorpFiles-2026!"   # temporary, will remove later
+    enterprise_network_cidr: 10.10.10.0/24
+    crczp_mgmt_cidr: 192.168.128.0/17          # CRCZP provisioning uses this subnet, it must be allowed
+
+  tasks:
+    - name: Install Samba
+      ansible.builtin.apt:
+        name: samba
+        state: present
+        update_cache: true
+
+    - name: Ensure corp-files group exists
+      ansible.builtin.group:
+        name: "{{ corp_files_group }}"
+        state: present
+
+    - name: Create shared corp-files directory
+      ansible.builtin.file:
+        path: "{{ corp_files_path }}"
+        state: directory
+        owner: root
+        group: "{{ corp_files_group }}"
+        mode: "2775"
+
+    - name: Create local fileserver system account (no shell login)
+      ansible.builtin.user:
+        name: "{{ smb_user }}"
+        groups: "{{ corp_files_group }}"
+        append: true
+        shell: /usr/sbin/nologin
+        create_home: false
+
+    - name: Create local fileserver-admin account
+      ansible.builtin.user:
+        name: "{{ smb_admin }}"
+        groups: "{{ corp_files_group }}"
+        append: true
+        shell: /usr/sbin/nologin
+        create_home: false
+
+    - name: Set Samba password for fileserver account
+      ansible.builtin.shell: |
+        (echo "{{ smb_password }}"; echo "{{ smb_password }}") | smbpasswd -s -a "{{ smb_user }}"
+      no_log: true
+      changed_when: true
+
+    - name: Set Samba password for fileserver-admin
+      ansible.builtin.shell: |
+        (echo "{{ smb_password }}"; echo "{{ smb_password }}") | smbpasswd -s -a "{{ smb_admin }}"
+      no_log: true
+      changed_when: true
+
+    - name: Enable and unlock the Samba user
+      ansible.builtin.command: smbpasswd -e "{{ smb_user }}"
+      changed_when: true
+
+    - name: Enable and unlock the Samba admin
+      ansible.builtin.command: smbpasswd -e "{{ smb_admin }}"
+      changed_when: true
+
+    - name: Configure Samba share
+      ansible.builtin.blockinfile:
+        path: /etc/samba/smb.conf
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - corp-files share"
+        block: |
+          [corp-files]
+          path = {{ corp_files_path }}
+          valid users = @{{ corp_files_group }}
+          force group = {{ corp_files_group }}
+          create mask = 0664
+          directory mask = 2775
+          read only = no
+          browseable = yes
+      notify: restart smbd
+
+    - name: Ensure iptables-persistent is installed
+      ansible.builtin.apt:
+        name: iptables-persistent
+        state: present
+
+    - name: Allow SMB (445) from the CRCZP management network
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "445"
+        source: "{{ crczp_mgmt_cidr }}"
+        jump: ACCEPT
+        comment: "CRCZP management network"
+
+    - name: Allow SMB (445) from the enterprise network (incl. SOC)
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "445"
+        source: "{{ enterprise_network_cidr }}"
+        jump: ACCEPT
+        comment: "Allow SMB from enterprise + SOC network"
+
+    - name: Allow legacy NetBIOS session (139) from enterprise network
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "139"
+        source: "{{ enterprise_network_cidr }}"
+        jump: ACCEPT
+        comment: "Allow NetBIOS session from enterprise + SOC network"
+
+    - name: Drop SMB (445) from everywhere else
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "445"
+        jump: DROP
+        comment: "Block SMB from outside enterprise network"
+
+    - name: Drop NetBIOS (139) from everywhere else
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "139"
+        jump: DROP
+        comment: "Block NetBIOS from outside enterprise network"
+
+    - name: Save iptables rules
+      ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
+      changed_when: false
+
+  handlers:
+    - name: restart smbd
+      ansible.builtin.service:
+        name: smbd
+        state: restarted
+
+- name: VLAN trunk overlay (hub-and-spoke VXLAN + 802.1Q, persistent)
+  hosts: enterprise-router:enterprise-host-linux:enterprise-web:enterprise-app:enterprise-db:enterprise-file:enterprise-auth:soc-host
+  become: true
+  vars:
+    trunk_hub: enterprise-router
+    trunk_dstport: 4789
+    trunk_mtu: 1400        # tunnel and bridge MTU (underlay 1450 minus 50)
+    trunk_vlan_mtu: 1396   # VLAN interfaces (4 bytes less for the 802.1Q tag)
+    trunk_vlans: [10, 20, 30]
+    # vid 10 = enterprise hosts, 20 = servers, 30 = SOC
+    # hub_ip = the router's own address on the spoke's real network
+    # addr = overlay address (third octet = VLAN ID, last octet = real IP's last octet)
+    trunk_spokes:
+      enterprise-host-linux: {vni: 101, vid: 10, short: host, real_ip: 10.10.10.10,  hub_ip: 10.10.10.1,   addr: 172.16.10.10}
+      enterprise-web:        {vni: 102, vid: 20, short: web,  real_ip: 10.10.10.66,  hub_ip: 10.10.10.65,  addr: 172.16.20.66}
+      enterprise-app:        {vni: 103, vid: 20, short: app,  real_ip: 10.10.10.67,  hub_ip: 10.10.10.65,  addr: 172.16.20.67}
+      enterprise-db:         {vni: 104, vid: 20, short: db,   real_ip: 10.10.10.68,  hub_ip: 10.10.10.65,  addr: 172.16.20.68}
+      enterprise-file:       {vni: 105, vid: 20, short: file, real_ip: 10.10.10.69,  hub_ip: 10.10.10.65,  addr: 172.16.20.69}
+      enterprise-auth:       {vni: 106, vid: 20, short: auth, real_ip: 10.10.10.70,  hub_ip: 10.10.10.65,  addr: 172.16.20.70}
+      soc-host:              {vni: 107, vid: 30, short: soc,  real_ip: 10.10.10.200, hub_ip: 10.10.10.129, addr: 172.16.30.200}
+
+  tasks:
+    - name: Write the hub overlay script (VLAN-aware bridge + one tunnel per spoke)
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/vlan-overlay.sh
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          # Managed by Ansible: VLAN trunk hub on {{ inventory_hostname }}
+          modprobe vxlan 2>/dev/null
+          modprobe 8021q 2>/dev/null
+          wait_for_ip() {
+            n=0
+            while ! ip -o -4 addr show | grep -q " $1/"; do
+              n=$((n+1))
+              [ "$n" -gt 60 ] && return 1
+              sleep 1
+            done
+          }
+          {% for spoke in trunk_spokes.values() %}
+          ip link del vx-{{ spoke.short }} 2>/dev/null
+          {% endfor %}
+          ip link del br-trunk 2>/dev/null
+          ip link add br-trunk type bridge vlan_filtering 1
+          ip link set br-trunk mtu {{ trunk_mtu }} up
+          {% for spoke in trunk_spokes.values() %}
+          wait_for_ip {{ spoke.hub_ip }} || echo "timeout waiting for {{ spoke.hub_ip }}" >&2
+          ip link add vx-{{ spoke.short }} type vxlan id {{ spoke.vni }} local {{ spoke.hub_ip }} remote {{ spoke.real_ip }} dstport {{ trunk_dstport }}
+          ip link set vx-{{ spoke.short }} mtu {{ trunk_mtu }} master br-trunk up
+          bridge vlan del dev vx-{{ spoke.short }} vid 1
+          bridge vlan add dev vx-{{ spoke.short }} vid {{ spoke.vid }}
+          {% endfor %}
+          {% for vid in trunk_vlans %}
+          bridge vlan add dev br-trunk vid {{ vid }} self
+          ip link add link br-trunk name br-trunk.{{ vid }} type vlan id {{ vid }}
+          ip link set br-trunk.{{ vid }} mtu {{ trunk_vlan_mtu }} up
+          ip addr add 172.16.{{ vid }}.1/24 dev br-trunk.{{ vid }}
+          {% endfor %}
+      when: inventory_hostname == trunk_hub
+      notify: restart vlan-overlay
+
+    - name: Write the spoke overlay script (one tunnel to the hub + VLAN sub-interface)
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/vlan-overlay.sh
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          # Managed by Ansible: VLAN trunk spoke on {{ inventory_hostname }}
+          {% set me = trunk_spokes[inventory_hostname] %}
+          modprobe vxlan 2>/dev/null
+          modprobe 8021q 2>/dev/null
+          wait_for_ip() {
+            n=0
+            while ! ip -o -4 addr show | grep -q " $1/"; do
+              n=$((n+1))
+              [ "$n" -gt 60 ] && return 1
+              sleep 1
+            done
+          }
+          wait_for_ip {{ me.real_ip }} || exit 1
+          ip link del vxlan-trunk 2>/dev/null
+          ip link add vxlan-trunk type vxlan id {{ me.vni }} local {{ me.real_ip }} remote {{ me.hub_ip }} dstport {{ trunk_dstport }}
+          ip link set vxlan-trunk mtu {{ trunk_mtu }} up
+          ip link add link vxlan-trunk name vxlan-trunk.{{ me.vid }} type vlan id {{ me.vid }}
+          ip link set vxlan-trunk.{{ me.vid }} mtu {{ trunk_vlan_mtu }} up
+          ip addr add {{ me.addr }}/24 dev vxlan-trunk.{{ me.vid }}
+          ip route add 172.16.0.0/16 via 172.16.{{ me.vid }}.1 dev vxlan-trunk.{{ me.vid }}
+      when: inventory_hostname != trunk_hub
+      notify: restart vlan-overlay
+
+    - name: Install the boot-time service that rebuilds the overlay
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/vlan-overlay.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=VLAN trunk overlay (VXLAN + 802.1Q)
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/local/sbin/vlan-overlay.sh
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: restart vlan-overlay
+
+    - name: Enable the overlay service at boot
+      ansible.builtin.systemd:
+        name: vlan-overlay
+        enabled: true
+        daemon_reload: true
+
+    - name: Ensure iptables-persistent is installed on the hub
+      ansible.builtin.apt:
+        name: iptables-persistent
+        state: present
+        update_cache: true
+      when: inventory_hostname == trunk_hub
+
+    - name: Drop routed traffic between VLAN interfaces
+      ansible.builtin.iptables:
+        chain: FORWARD
+        in_interface: "br-trunk.+"
+        out_interface: "br-trunk.+"
+        jump: DROP
+        comment: "Isolate VLANs from each other"
+      when: inventory_hostname == trunk_hub
+
+    - name: Save iptables rules
+      ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
+      changed_when: false
+      when: inventory_hostname == trunk_hub
+
+  handlers:
+    - name: restart vlan-overlay
+      ansible.builtin.systemd:
+        name: vlan-overlay
+        state: restarted

@@ -364,3 +364,151 @@
       ansible.builtin.service:
         name: smbd
         state: restarted
+
+- name: VLAN trunk overlay (hub-and-spoke VXLAN + 802.1Q, persistent)
+  hosts: enterprise-router:enterprise-host-linux:enterprise-web:enterprise-app:enterprise-db:enterprise-file:enterprise-auth:soc-host
+  become: true
+  vars:
+    trunk_hub: enterprise-router
+    trunk_dstport: 4789
+    trunk_mtu: 1400        # tunnel and bridge MTU (underlay 1450 minus 50)
+    trunk_vlan_mtu: 1396   # VLAN interfaces (4 bytes less for the 802.1Q tag)
+    trunk_vlans: [10, 20, 30]
+    # vid 10 = enterprise hosts, 20 = servers, 30 = SOC
+    # hub_ip = the router's own address on the spoke's real network
+    # addr = overlay address (third octet = VLAN ID, last octet = real IP's last octet)
+    trunk_spokes:
+      enterprise-host-linux: {vni: 101, vid: 10, short: host, real_ip: 10.10.10.10,  hub_ip: 10.10.10.1,   addr: 172.16.10.10}
+      enterprise-web:        {vni: 102, vid: 20, short: web,  real_ip: 10.10.10.66,  hub_ip: 10.10.10.65,  addr: 172.16.20.66}
+      enterprise-app:        {vni: 103, vid: 20, short: app,  real_ip: 10.10.10.67,  hub_ip: 10.10.10.65,  addr: 172.16.20.67}
+      enterprise-db:         {vni: 104, vid: 20, short: db,   real_ip: 10.10.10.68,  hub_ip: 10.10.10.65,  addr: 172.16.20.68}
+      enterprise-file:       {vni: 105, vid: 20, short: file, real_ip: 10.10.10.69,  hub_ip: 10.10.10.65,  addr: 172.16.20.69}
+      enterprise-auth:       {vni: 106, vid: 20, short: auth, real_ip: 10.10.10.70,  hub_ip: 10.10.10.65,  addr: 172.16.20.70}
+      soc-host:              {vni: 107, vid: 30, short: soc,  real_ip: 10.10.10.200, hub_ip: 10.10.10.129, addr: 172.16.30.200}
+
+  tasks:
+    - name: Write the hub overlay script (VLAN-aware bridge + one tunnel per spoke)
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/vlan-overlay.sh
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          # Managed by Ansible: VLAN trunk hub on {{ inventory_hostname }}
+          modprobe vxlan 2>/dev/null
+          modprobe 8021q 2>/dev/null
+          wait_for_ip() {
+            n=0
+            while ! ip -o -4 addr show | grep -q " $1/"; do
+              n=$((n+1))
+              [ "$n" -gt 60 ] && return 1
+              sleep 1
+            done
+          }
+          {% for spoke in trunk_spokes.values() %}
+          ip link del vx-{{ spoke.short }} 2>/dev/null
+          {% endfor %}
+          ip link del br-trunk 2>/dev/null
+          ip link add br-trunk type bridge vlan_filtering 1
+          ip link set br-trunk mtu {{ trunk_mtu }} up
+          {% for spoke in trunk_spokes.values() %}
+          wait_for_ip {{ spoke.hub_ip }} || echo "timeout waiting for {{ spoke.hub_ip }}" >&2
+          ip link add vx-{{ spoke.short }} type vxlan id {{ spoke.vni }} local {{ spoke.hub_ip }} remote {{ spoke.real_ip }} dstport {{ trunk_dstport }}
+          ip link set vx-{{ spoke.short }} mtu {{ trunk_mtu }} master br-trunk up
+          bridge vlan del dev vx-{{ spoke.short }} vid 1
+          bridge vlan add dev vx-{{ spoke.short }} vid {{ spoke.vid }}
+          {% endfor %}
+          {% for vid in trunk_vlans %}
+          bridge vlan add dev br-trunk vid {{ vid }} self
+          ip link add link br-trunk name br-trunk.{{ vid }} type vlan id {{ vid }}
+          ip link set br-trunk.{{ vid }} mtu {{ trunk_vlan_mtu }} up
+          ip addr add 172.16.{{ vid }}.1/24 dev br-trunk.{{ vid }}
+          {% endfor %}
+      when: inventory_hostname == trunk_hub
+      notify: restart vlan-overlay
+
+    - name: Write the spoke overlay script (one tunnel to the hub + VLAN sub-interface)
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/vlan-overlay.sh
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          # Managed by Ansible: VLAN trunk spoke on {{ inventory_hostname }}
+          {% set me = trunk_spokes[inventory_hostname] %}
+          modprobe vxlan 2>/dev/null
+          modprobe 8021q 2>/dev/null
+          wait_for_ip() {
+            n=0
+            while ! ip -o -4 addr show | grep -q " $1/"; do
+              n=$((n+1))
+              [ "$n" -gt 60 ] && return 1
+              sleep 1
+            done
+          }
+          wait_for_ip {{ me.real_ip }} || exit 1
+          ip link del vxlan-trunk 2>/dev/null
+          ip link add vxlan-trunk type vxlan id {{ me.vni }} local {{ me.real_ip }} remote {{ me.hub_ip }} dstport {{ trunk_dstport }}
+          ip link set vxlan-trunk mtu {{ trunk_mtu }} up
+          ip link add link vxlan-trunk name vxlan-trunk.{{ me.vid }} type vlan id {{ me.vid }}
+          ip link set vxlan-trunk.{{ me.vid }} mtu {{ trunk_vlan_mtu }} up
+          ip addr add {{ me.addr }}/24 dev vxlan-trunk.{{ me.vid }}
+          ip route add 172.16.0.0/16 via 172.16.{{ me.vid }}.1 dev vxlan-trunk.{{ me.vid }}
+      when: inventory_hostname != trunk_hub
+      notify: restart vlan-overlay
+
+    - name: Install the boot-time service that rebuilds the overlay
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/vlan-overlay.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=VLAN trunk overlay (VXLAN + 802.1Q)
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/local/sbin/vlan-overlay.sh
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: restart vlan-overlay
+
+    - name: Enable the overlay service at boot
+      ansible.builtin.systemd:
+        name: vlan-overlay
+        enabled: true
+        daemon_reload: true
+
+    - name: Ensure iptables-persistent is installed on the hub
+      ansible.builtin.apt:
+        name: iptables-persistent
+        state: present
+        update_cache: true
+      when: inventory_hostname == trunk_hub
+
+    - name: Drop routed traffic between VLAN interfaces
+      ansible.builtin.iptables:
+        chain: FORWARD
+        in_interface: "br-trunk.+"
+        out_interface: "br-trunk.+"
+        jump: DROP
+        comment: "Isolate VLANs from each other"
+      when: inventory_hostname == trunk_hub
+
+    - name: Save iptables rules
+      ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
+      changed_when: false
+      when: inventory_hostname == trunk_hub
+
+  handlers:
+    - name: restart vlan-overlay
+      ansible.builtin.systemd:
+        name: vlan-overlay
+        state: restarted

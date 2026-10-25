@@ -512,3 +512,94 @@
       ansible.builtin.systemd:
         name: vlan-overlay
         state: restarted
+
+- name: Enforce isolation between attacker-net and enterprise/SOC networks
+  hosts: enterprise-router:attacker-router
+  become: true
+  vars:
+    attacker_cidr: 192.168.1.0/24
+    enterprise_cidr: 10.10.10.0/24   # covers enterprise-host-net, enterprise-prod-net, and soc-net
+
+  tasks:
+    - name: Ensure iptables-persistent is installed
+      ansible.builtin.apt:
+        name: iptables-persistent
+        state: present
+        update_cache: true
+
+    - name: Drop forwarded traffic from attacker-net to enterprise/SOC network
+      ansible.builtin.iptables:
+        chain: FORWARD
+        protocol: all
+        source: "{{ attacker_cidr }}"
+        destination: "{{ enterprise_cidr }}"
+        jump: DROP
+        comment: "Isolate attacker-net from enterprise/SOC network"
+
+    - name: Drop forwarded traffic from enterprise/SOC network to attacker-net
+      ansible.builtin.iptables:
+        chain: FORWARD
+        protocol: all
+        source: "{{ enterprise_cidr }}"
+        destination: "{{ attacker_cidr }}"
+        jump: DROP
+        comment: "Isolate enterprise/SOC network from attacker-net"
+
+    - name: Save iptables rules
+      ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
+      changed_when: false
+
+- name: Publish the public site on enterprise-router's external address
+  hosts: enterprise-router
+  become: true
+  vars:
+    web_ip: 10.10.10.66
+    public_port: 80
+
+  tasks:
+    - name: Find the external (wan) address
+      ansible.builtin.set_fact:
+        wan_ip: "{{ ansible_all_ipv4_addresses | select('match', '^100\\.100\\.100\\.') | first }}"
+
+    - name: Show the public address
+      ansible.builtin.debug:
+        msg: "Public site address: http://{{ wan_ip }}:{{ public_port }}/"
+
+    - name: Forward the public port to enterprise-web
+      ansible.builtin.iptables:
+        table: nat
+        chain: PREROUTING
+        protocol: tcp
+        destination: "{{ wan_ip }}"
+        destination_port: "{{ public_port }}"
+        jump: DNAT
+        to_destination: "{{ web_ip }}:{{ public_port }}"
+        comment: "Publish the public site"
+
+    - name: Allow forwarded traffic for the published site
+      ansible.builtin.iptables:
+        chain: FORWARD
+        action: insert
+        rule_num: "1"
+        protocol: tcp
+        destination: "{{ web_ip }}"
+        destination_port: "{{ public_port }}"
+        ctstate:
+          - DNAT
+        jump: ACCEPT
+        comment: "Allow the published public site"
+
+    - name: Allow replies to connections that were already allowed
+      ansible.builtin.iptables:
+        chain: FORWARD
+        action: insert
+        rule_num: "1"
+        ctstate:
+          - ESTABLISHED
+          - RELATED
+        jump: ACCEPT
+        comment: "Replies to allowed connections"
+
+    - name: Save iptables rules
+      ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
+      changed_when: false

@@ -365,6 +365,137 @@
         name: smbd
         state: restarted
 
+- name: Web server with a public and a private site (enterprise-web)
+  hosts: enterprise-web
+  become: true
+  vars:
+    public_port: 80
+    private_port: 8080
+    web_root: /var/www
+    enterprise_cidrs:
+      - 10.10.10.0/24    # real enterprise subnets, including SOC
+      - 172.16.0.0/16    # VLAN overlay
+
+  tasks:
+    - name: Install nginx and iptables-persistent
+      ansible.builtin.apt:
+        name:
+          - nginx
+          - iptables-persistent
+        state: present
+        update_cache: true
+
+    - name: Create site directories
+      ansible.builtin.file:
+        path: "{{ web_root }}/{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - public
+        - private
+
+    - name: Write the public test page
+      ansible.builtin.copy:
+        dest: "{{ web_root }}/public/index.html"
+        mode: "0644"
+        content: |
+          <!doctype html>
+          <html>
+          <head><title>Corp public site</title></head>
+          <body>
+            <h1>Corp public site</h1>
+            <p>Test page served by enterprise-web on port {{ public_port }}. Open to the internet.</p>
+          </body>
+          </html>
+
+    - name: Write the private test page
+      ansible.builtin.copy:
+        dest: "{{ web_root }}/private/index.html"
+        mode: "0644"
+        content: |
+          <!doctype html>
+          <html>
+          <head><title>Corp private site</title></head>
+          <body>
+            <h1>Corp private site</h1>
+            <p>Test page served by enterprise-web on port {{ private_port }}. Enterprise network only.</p>
+          </body>
+          </html>
+
+    - name: Remove the default nginx site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: reload nginx
+
+    - name: Configure the two sites
+      ansible.builtin.copy:
+        dest: /etc/nginx/conf.d/corp-sites.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          server {
+              listen {{ public_port }} default_server;
+              server_name _;
+              root {{ web_root }}/public;
+              index index.html;
+              access_log /var/log/nginx/public_access.log;
+          }
+
+          server {
+              listen {{ private_port }};
+              server_name _;
+              root {{ web_root }}/private;
+              index index.html;
+              access_log /var/log/nginx/private_access.log;
+          {% for cidr in enterprise_cidrs %}
+              allow {{ cidr }};
+          {% endfor %}
+              deny all;
+          }
+      notify: reload nginx
+
+    - name: Check the nginx configuration
+      ansible.builtin.command: nginx -t
+      changed_when: false
+
+    - name: Ensure nginx is running and enabled
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Allow the private site from the enterprise network (firewall)
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "{{ private_port }}"
+        source: "{{ item }}"
+        jump: ACCEPT
+        comment: "Private site: enterprise network"
+      loop: "{{ enterprise_cidrs }}"
+
+    - name: Drop the private site from everywhere else (firewall)
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "{{ private_port }}"
+        jump: DROP
+        comment: "Private site: block all others"
+
+    - name: Save iptables rules
+      ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
+      changed_when: false
+
+  handlers:
+    - name: reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+
 - name: VLAN trunk overlay (hub-and-spoke VXLAN + 802.1Q, persistent)
   hosts: enterprise-router:enterprise-host-linux:enterprise-web:enterprise-app:enterprise-db:enterprise-file:enterprise-auth:soc-host
   become: true
